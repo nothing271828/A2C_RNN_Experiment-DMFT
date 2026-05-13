@@ -1,0 +1,225 @@
+\documentclass[UTF8]{ctexart}
+\usepackage{amsmath, amssymb, bm}
+\usepackage[margin=1in]{geometry}
+
+\begin{document}
+
+
+\section{基本设定}
+    \paragraph{模型设定}
+    考虑推广到多数据集（多轨迹）情形。设有 $M$ 条独立轨迹，每条轨迹具有自己的环境输入 $s^\mu$、动作序列、奖励序列等。网络参数 $J, U, V^p, V^v$ 为所有轨迹共享。对于第 $\mu$ 条轨迹，RNN满足迭代方程：
+    \begin{align}
+        &t_n = n \Delta t,\ n = 1, 2, \cdots , n_T \notag\\
+        &\begin{cases}
+            h_i^\mu (t_1) = h^{\mu,0}\\
+            h_i^\mu(t_n) = (1- \Delta t) h_i^\mu(t_{n-1}) + \Delta t \left( \frac{g}{\sqrt{N}} \sum_{j=1}^N J_{ij} \phi(h_j^\mu(t_{n-1})) + \sum_{j = 1}^{D_s} U_{ij} s_j^\mu(t_{n-1})\right)
+        \end{cases}
+    \end{align}
+    
+    定义读出量：
+    \begin{align}
+        &y_i^\mu(t_n) := \frac{1}{N} \sum_{j=1}^N V_{ij}^p h_j^\mu(t_n) \\
+        &\Psi_{a_t^\mu}(y_1^\mu, y_2^\mu ,\cdots , y_{D_a}^\mu) \equiv \Psi_{a_t^\mu}(\mathbf{y}^\mu) := \ln(\pi_\varphi(a_t^\mu|s_t^\mu)) \\
+        &z^\mu(t_n) := \frac{1}{N c_v} \sum_{j=1}^{N} V_{j}^v \phi(h_j^\mu(t_n)) := V_\theta(s^\mu)\\
+        &A^\mu(t_n) := r_t^\mu+\gamma(1-d_t^\mu)z^\mu(t_{n+1}) - z^\mu(t_n)
+    \end{align}
+
+    假设每条轨迹上的系统状态 $s^\mu$ 与行动 $a^\mu$、奖励 $r^\mu$ 均无关。对于给定的多组环境输入 $\{s^\mu\}$，系统总能量函数为
+    \begin{equation}
+    \begin{aligned}
+         E_\tau(\varphi,\theta) &= N \sum_{\mu=1}^M \mathbb{E}_{a_n^\mu \sim \pi(\varphi)} \sum_{n=1}^{n_T} \left[  - c_p \Psi_{a_n^\mu}(\mathbf{y}^\mu) A^\mu(t_n) + \frac{c_v^2}{2} (A^\mu)^2(t_n) \right] + E_{reg} \\
+         &= N \sum_{\mu=1}^M\sum_{\{a_n^\mu\}} \left[ \prod_{n=1}^{n_T} \pi_\varphi(a_t^\mu |s_t^\mu) \right] \left\{ \sum_{n=1}^{n_T} \left[  - c_p \Psi_{a_n^\mu}(\mathbf{y}^\mu) A^\mu(t_n) + \frac{c_v^2}{2} (A^\mu)^2(t_n) \right] \right\} + E_{reg}
+    \end{aligned}
+    \end{equation}
+    其中 $E_{reg} = \frac{1}{2 \beta }\left( ||J||^2 + ||U||^2 + ||V^p||^2 + ||V^v||^2 \right)$.
+    \paragraph{多轨迹配分函数}
+     \begin{equation}
+    \begin{aligned}
+    S(C, \hat{C}, y, \hat{y}, z, \hat{z}) &= - \ln W(C, \hat{C}, \hat{y}) + \frac{\Delta t^2}{2} \sum_{\mu,\nu=1}^M \sum_{n, n'=1}^{n_T} \hat{C}^{\mu\nu}(t_n, t_{n'}) C^{\mu\nu}(t_n, t_{n'})  \\
+            &+ \Delta t\sum_{\mu=1}^M \sum_{n=1}^{n_T} \left[ \sum_{i=1}^{D_a} \hat{y}_i^\mu(t_n) y_i^\mu(t_n) + \hat{z}^\mu(t_n) z^\mu(t_n) \right] - \frac{\Delta t^2}{2 c_v^2}  \sum_{\mu,\nu=1}^M \sum_{n, n'}  \hat{z}^\mu(t_n) \hat{z}^\nu(t_{n'}) C^{\mu\nu}(t_n,t_{n'})\\
+            &+\beta \sum_{\mu=1}^M \mathbb{E}_{a_n^\mu \sim \pi(\varphi)} \sum_{n=1}^{n_T} \Big[  - c_p \Psi_{a_n^\mu}(\mathbf{y}^\mu) \left(  r_t^\mu +\gamma(1-d_t^\mu)z^\mu(t_{n+1}) - z^\mu(t_n)\right) \\
+            &+ \frac{c_v^2}{2} \left(  r_t^\mu +\gamma(1-d_t^\mu)z^\mu(t_{n+1}) - z^\mu(t_n)\right)^2 \Big] \\
+    \end{aligned}
+    \end{equation}
+    配分函数：
+    \begin{equation}
+        Z = \int e^{-N S(C, \hat{C}, y, \hat{y}, z, \hat{z})}\, \mathcal{D}C \mathcal{D}\hat{C} \mathcal{D} y \mathcal{D} \hat{y} \mathcal{D} z \mathcal{D} \hat{z}.
+    \end{equation}
+
+    其中$C, y, z \in \mathbb{R} \quad, \hat{C}, \hat{y}, \hat{z} \in i\mathbb{R}$, 积分范围为相应的实轴（虚轴）负无穷到正无穷
+
+    \paragraph{$W$的定义}
+    \begin{equation}
+    \begin{aligned}
+    &W(C, \hat{C}, \hat{y}) := \\
+        &\Bigg\langle \exp \left\{  \frac{\Delta t^2}{2} \sum_{\mu,\nu} \sum_{n, n'} \left[ \sum_{i=1}^{D_a} \hat{y}_i^\mu(t_n) \hat{y}_i^\nu(t_{n'}) h^{\mu}(t_n) h^{\nu}(t_{n'}) + \phi^{\mu}(t_n) \hat{C}^{\mu\nu}(t_n, t_{n'}) \phi^{\nu}(t_{n'}) \right] \right\}\Bigg\rangle_{\mathbf{\eta}}
+    \end{aligned}
+    \end{equation}
+
+    其中 $\phi(t_n):=\phi(h(t_n))$为激活值, $\mathbf{h}$ 满足动力学：
+    \begin{equation}
+        \begin{cases}
+        h^{\mu}(t_1) = h^{0\mu}\\
+        h^{\mu}(t_n) = (1 - \Delta t)h^{\mu}(t_{n-1}) + \Delta t\eta^\mu(t_{n-1}) \\
+        \eta^\mu\text{是均值为0的高斯随机变量，且}\langle \eta^\mu \eta^\nu \rangle =g^2 C^{\mu \nu} + C^{I, \mu \nu}
+        \end{cases}
+    \end{equation}
+
+
+\section{DMFT数值求解思路}
+    \subsection{整体解法}
+    对于如下形式的积分：
+    \begin{equation}
+        Z = \int e^{-NS(C, \hat{C})} \mathcal{D}C \mathcal{D}\hat{C}, \quad C \in \mathbb{R},\hat{C} \in i \mathbb{R}
+    \end{equation}
+    在$N \to \infty$ 极限下，只有极值点有贡献。
+
+    \par 标准DMFT数值求解方法为：强制将$C$和$\hat{C}$均视为实数，则S也成为纯实数，问题变为求解$S$关于$C$的极小值点和S关于$\hat{C}$的极大值点。
+
+    \par 为了求解以上极大-极小值问题，采用迭代法：
+    \begin{equation}
+        \frac{d}{dt}\begin{pmatrix}C\\\hat{C}\end{pmatrix}=-P \begin{pmatrix}
+            \frac{\partial S}{\partial C}\\
+            \frac{\partial S}{\partial \hat{C}}
+        \end{pmatrix}
+    \end{equation}
+    其中P有两种取法：
+    \begin{equation}
+        P_{diag} = \begin{pmatrix}
+            \alpha & 0 \\
+            0 & -\hat{\alpha}
+        \end{pmatrix}, 
+        \quad P_{off-diag}=\begin{pmatrix}
+            0 & \alpha \\
+            \hat{\alpha} & 0
+        \end{pmatrix}
+    \end{equation}
+
+    \par 以上是对于只有一组变量的情况，但是很容易推广到多组，不再赘述
+
+
+\subsection{记号化简与矩阵化 (Flattening)}
+为了便于编程实现和数学推导，我们将轨迹索引 $\mu$ 和时间索引 $n$ 合并为一个联合索引 $\alpha = (\mu, n)$，其取值范围为 $1, 2, \cdots, K$，其中 $K = M \times n_T$。
+由此，系统变量可以写为矩阵或向量形式：
+\begin{itemize}
+    \item $C, \hat{C} \in \mathbb{R}^{K \times K}$，其中 $C_{\alpha\beta} \equiv C^{\mu\nu}(t_n, t_{n'})$
+    \item $y_i, \hat{y}_i \in \mathbb{R}^K$ （对于每个动作维度 $i=1,\cdots,D_a$）
+    \item $z, \hat{z}, h, \phi, \eta \in \mathbb{R}^K$
+\end{itemize}
+
+作用量（Action）$S$ 可以拆分为三个部分：$S = -\ln W + S_{\text{quad}} + S_{\text{RL}}$，其中：
+\begin{align}
+    S_{\text{quad}} &= \frac{\Delta t^2}{2} \text{Tr}(\hat{C}^T C) + \Delta t \sum_{i=1}^{D_a} \hat{y}_i^T y_i + \Delta t \hat{z}^T z - \frac{\Delta t^2}{2 c_v^2} \hat{z}^T C \hat{z} \\
+    S_{\text{RL}} &= \beta \sum_{\alpha=1}^K \mathbb{E}_{a^\alpha \sim \pi} \left[ - c_p \Psi_{a^\alpha}(\mathbf{y}^\alpha) A^\alpha + \frac{c_v^2}{2} (A^\alpha)^2 \right]
+\end{align}
+（注意：此处 $A^\alpha$ 依然包含时间差分 $z^{\mu}(t_{n+1}) - z^\mu(t_n)$，在编程时可通过对 $z$ 向量进行移位操作来实现）。
+
+$W$ 的定义在联合索引下变为：
+\begin{equation}
+    W(C, \hat{C}, \hat{y}) = \left\langle \exp\left( O(h, \hat{C}, \hat{y}) \right) \right\rangle_{\eta}
+\end{equation}
+其中指数项 $O$ 为：
+\begin{equation}
+    O = \frac{\Delta t^2}{2} \left[ \sum_{i=1}^{D_a} h^T (\hat{y}_i \hat{y}_i^T) h + \phi^T \hat{C} \phi \right]
+\end{equation}
+噪声 $\eta \sim \mathcal{N}(0, \Sigma)$，其协方差矩阵为 $\Sigma = g^2 C + C^I$。
+
+\subsection{非 $W$ 部分的偏导数 (可由 PyTorch 自动微分)}
+对于 $S_{\text{quad}} + S_{\text{RL}}$，其对各个变量的偏导数是非常直接的。在实际编程中，**强烈建议对这部分直接使用 PyTorch 的 \texttt{torch.autograd.grad}**。
+解析表达式如下：
+\begin{align}
+    \frac{\partial S_{\text{quad}}}{\partial C} &= \frac{\Delta t^2}{2} \hat{C} - \frac{\Delta t^2}{2 c_v^2} \hat{z} \hat{z}^T \\
+    \frac{\partial S_{\text{quad}}}{\partial \hat{C}} &= \frac{\Delta t^2}{2} C \\
+    \frac{\partial S_{\text{quad}}}{\partial y_i} &= \Delta t \hat{y}_i, \quad \frac{\partial S_{\text{quad}}}{\partial \hat{y}_i} = \Delta t y_i \\
+    \frac{\partial S_{\text{quad}}}{\partial z} &= \Delta t \hat{z}, \quad \frac{\partial S_{\text{quad}}}{\partial \hat{z}} = \Delta t z - \frac{\Delta t^2}{c_v^2} C \hat{z}
+\end{align}
+$S_{\text{RL}}$ 仅依赖于 $y$ 和 $z$，其导数 $\frac{\partial S_{\text{RL}}}{\partial y}$ 和 $\frac{\partial S_{\text{RL}}}{\partial z}$ 依赖于具体的 Actor-Critic 网络结构和环境奖励，通过蒙特卡洛采样动作 $a$ 并利用自动微分求得。
+
+\subsection{$W$ 部分的偏导数 (需手动实现)}
+定义加权期望 $\langle \cdot \rangle_W$ 为：对于任意函数 $F(\eta)$，有
+\begin{equation}
+    \langle F \rangle_W := \frac{\langle F e^O \rangle_\eta}{\langle e^O \rangle_\eta}
+\end{equation}
+在数值实现中，这等价于对采样的 $\eta$ 轨迹计算 $e^O$ 作为权重，进行加权平均（注意使用 Log-Sum-Exp 技巧防止数值溢出）。
+
+\subsubsection{对 $\hat{C}$ 和 $\hat{y}$ 的偏导数}
+由于 $C$ 没有出现在 $O$ 中，这两者的求导非常简单，直接将导数放入期望内部：
+\begin{align}
+    \frac{\partial (-\ln W)}{\partial \hat{C}_{\alpha\beta}} &= - \left\langle \frac{\partial O}{\partial \hat{C}_{\alpha\beta}} \right\rangle_W = - \frac{\Delta t^2}{2} \langle \phi_\alpha \phi_\beta \rangle_W \quad \Rightarrow \quad \frac{\partial (-\ln W)}{\partial \hat{C}} = - \frac{\Delta t^2}{2} \langle \phi \phi^T \rangle_W \\
+    \frac{\partial (-\ln W)}{\partial \hat{y}_{i,\alpha}} &= - \left\langle \frac{\partial O}{\partial \hat{y}_{i,\alpha}} \right\rangle_W = - \Delta t^2 \sum_{\beta} \langle \hat{y}_{i,\beta} h_\alpha h_\beta \rangle_W \quad \Rightarrow \quad \frac{\partial (-\ln W)}{\partial \hat{y}_i} = - \Delta t^2 \langle (\hat{y}_i^T h) h \rangle_W
+\end{align}
+
+\subsubsection{对 $C$ 的偏导数 (核心难点)}
+$C$ 并没有显式出现在 $O$ 中，而是定义了噪声 $\eta$ 的协方差矩阵 $\Sigma = g^2 C + C^I$。
+对于多元高斯分布，根据 Price 定理（或高斯分部积分），对于任意函数 $f(\eta)$，有：
+\begin{equation}
+    \frac{\partial}{\partial \Sigma_{\alpha\beta}} \langle f(\eta) \rangle_\eta = \frac{1}{2} \left\langle \frac{\partial^2 f(\eta)}{\partial \eta_\alpha \partial \eta_\beta} \right\rangle_\eta
+\end{equation}
+因此，对 $C$ 的导数为：
+\begin{equation}
+    \frac{\partial W}{\partial C_{\alpha\beta}} = g^2 \frac{\partial W}{\partial \Sigma_{\alpha\beta}} = \frac{g^2}{2} \left\langle \frac{\partial^2 e^O}{\partial \eta_\alpha \partial \eta_\beta} \right\rangle_\eta
+\end{equation}
+利用链式法则 $\frac{\partial^2 e^O}{\partial \eta_\alpha \partial \eta_\beta} = \left( \frac{\partial^2 O}{\partial \eta_\alpha \partial \eta_\beta} + \frac{\partial O}{\partial \eta_\alpha} \frac{\partial O}{\partial \eta_\beta} \right) e^O$，我们得到：
+\begin{equation}
+    \frac{\partial (-\ln W)}{\partial C_{\alpha\beta}} = - \frac{g^2}{2} \left\langle \frac{\partial^2 O}{\partial \eta_\alpha \partial \eta_\beta} + \frac{\partial O}{\partial \eta_\alpha} \frac{\partial O}{\partial \eta_\beta} \right\rangle_W
+\end{equation}
+
+为了计算 $O$ 对 $\eta$ 的导数，需要引入\textbf{响应矩阵 (Response Matrix)} $R \in \mathbb{R}^{K \times K}$，定义为 $R_{\gamma\alpha} = \frac{\partial h_\gamma}{\partial \eta_\alpha}$。
+根据动力学方程 $h^\mu(t_n) = (1 - \Delta t)h^\mu(t_{n-1}) + \Delta t \eta^\mu(t_{n-1})$，可以解得：
+\begin{equation}
+    R_{(\mu, n), (\nu, m)} = \frac{\partial h^\mu(t_n)}{\partial \eta^\nu(t_m)} = \delta_{\mu\nu} \Delta t (1 - \Delta t)^{n - 1 - m} \Theta(n - 1 - m)
+\end{equation}
+其中 $\Theta(\cdot)$ 为阶跃函数（当自变量 $>0$ 时为 1，否则为 0）。注意 $R$ 是一个下三角矩阵。
+
+利用响应矩阵 $R$，我们可以将对 $\eta$ 的导数转化为对 $h$ 的导数。令向量 $u = \frac{\partial O}{\partial h} \in \mathbb{R}^K$，矩阵 $H = \frac{\partial^2 O}{\partial h \partial h} \in \mathbb{R}^{K \times K}$，则有：
+\begin{align}
+    \frac{\partial O}{\partial \eta_\alpha} &= \sum_\gamma \frac{\partial O}{\partial h_\gamma} R_{\gamma\alpha} \quad \Rightarrow \quad \nabla_\eta O = R^T u \\
+    \frac{\partial^2 O}{\partial \eta_\alpha \partial \eta_\beta} &= \sum_{\gamma, \rho} R_{\gamma\alpha} \frac{\partial^2 O}{\partial h_\gamma \partial h_\rho} R_{\rho\beta} \quad \Rightarrow \quad \nabla^2_\eta O = R^T H R
+\end{align}
+其中 $u$ 和 $H$ 的解析形式可以直接从 $O$ 的定义中求出（此处 $\odot$ 表示逐元素乘法，$\text{diag}$ 表示构建对角矩阵）：
+\begin{align}
+    u &= \Delta t^2 \left[ \sum_{i=1}^{D_a} \hat{y}_i (\hat{y}_i^T h) + \phi' \odot (\hat{C} \phi) \right] \\
+    H &= \Delta t^2 \left[ \sum_{i=1}^{D_a} \hat{y}_i \hat{y}_i^T + \text{diag}(\phi') \hat{C} \text{diag}(\phi') + \text{diag}\left( \phi'' \odot (\hat{C} \phi) \right) \right]
+\end{align}
+最终，对 $C$ 的偏导数可以写为优雅的矩阵形式：
+\begin{equation}
+    \frac{\partial (-\ln W)}{\partial C} = - \frac{g^2}{2} \left\langle R^T H R + (R^T u)(R^T u)^T \right\rangle_W
+\end{equation}
+
+\section{数值求解算法总结}
+
+结合上述推导，整体的数值迭代算法如下：
+
+\paragraph{Step 1: 初始化}
+初始化实数矩阵/向量 $C, \hat{C}, y, \hat{y}, z, \hat{z}$。
+
+\paragraph{Step 2: 蒙特卡洛采样计算 $W$ 的导数}
+\begin{enumerate}
+    \item 根据当前的协方差矩阵 $\Sigma = g^2 C + C^I$，采样 $N_s$ 条噪声轨迹 $\eta^{(s)} \sim \mathcal{N}(0, \Sigma)$。
+    \item 利用动力学方程计算对应的隐状态轨迹 $h^{(s)}$ 和激活值 $\phi^{(s)}$。
+    \item 计算每条轨迹的指数项 $O^{(s)}$。
+    \item 计算权重 $w^{(s)} = \text{softmax}(O^{(1)}, \dots, O^{(N_s)})$ （使用 Log-Sum-Exp 技巧）。
+    \item 利用公式计算 $-\ln W$ 对 $\hat{C}, \hat{y}$ 的导数（使用 $w^{(s)}$ 进行加权平均）。
+    \item 计算 $u^{(s)}$ 和 $H^{(s)}$，进而计算出 $\nabla_\eta O^{(s)}$ 和 $\nabla^2_\eta O^{(s)}$，最后加权平均得到 $-\ln W$ 对 $C$ 的导数。
+\end{enumerate}
+
+\paragraph{Step 3: 利用 PyTorch 计算剩余部分的导数}
+\begin{enumerate}
+    \item 将当前的 $C, \hat{C}, y, \hat{y}, z, \hat{z}$ 转换为 \texttt{torch.Tensor} 并设置 \texttt{requires\_grad=True}。
+    \item 构建作用量 $S_{\text{quad}} + S_{\text{RL}}$。对于 $S_{\text{RL}}$ 中关于行动 $a$ 的期望，可以通过在当前策略 $\pi_\varphi(a|x)$ 下采样动作 $a$ 来近似（REINFORCE 算法或重参数化技巧）。
+    \item 调用 \texttt{loss.backward()} 自动获取 $\frac{\partial (S_{\text{quad}} + S_{\text{RL}})}{\partial X}$。
+\end{enumerate}
+
+\paragraph{Step 4: 梯度更新 (极大-极小迭代)}
+汇总总导数 $\frac{\partial S}{\partial X}$。按照你定义的矩阵 $P_{diag}$ 或 $P_{off-diag}$ 进行迭代更新。例如，若使用 $P_{diag}$：
+\begin{align}
+    C &\leftarrow C - \epsilon \alpha \frac{\partial S}{\partial C} \\
+    \hat{C} &\leftarrow \hat{C} + \epsilon \hat{\alpha} \frac{\partial S}{\partial \hat{C}}
+\end{align}
+对于 $y, \hat{y}, z, \hat{z}$ 同样根据其在极值问题中的性质（极大化还是极小化）分配更新符号。
+
+\paragraph{Step 5: 检查收敛}
+重复 Step 2-4，直到导数趋近于 0 或变量变化量小于给定阈值。
+    
+\end{document}
+

@@ -35,10 +35,11 @@ class DMFTConfig:
         self.beta        = kwargs.get('beta', 10000.0)
 
         # DMFT numerics
-        self.N_samples = kwargs.get('N_samples', 5000)
+        self.N_samples = kwargs.get('N_samples', 2000)
         self.sigma_U   = kwargs.get('sigma_U', 1.0)
         self.eps_reg   = kwargs.get('eps_reg', 1e-6)
         self.dtype     = kwargs.get('dtype', torch.float64)
+        self.warm_start = kwargs.get('warm_start', False)
 
         # Derived
         self.K = self.M * self.T
@@ -150,13 +151,34 @@ class DMFTSolver(nn.Module):
         self.C_hat = nn.Parameter(torch.zeros(K, K, dtype=dt))
 
         # y   — minimise   (actor logits,  Da × K)
-        self.y = nn.Parameter(0.01 * torch.randn(Da, K, dtype=dt))
+        if self.cfg.warm_start:
+            # strong preference for correct action → starts in correct basin
+            y_init = torch.zeros(Da, K, dtype=dt)
+            for mu in range(self.M):
+                tgt = self.targets[mu]
+                for n in range(self.Tp):
+                    alpha = mu * self.Tp + n
+                    y_init[tgt, alpha]     = 5.0
+                    y_init[1 - tgt, alpha] = -5.0
+            self.y = nn.Parameter(y_init + 0.01 * torch.randn(Da, K, dtype=dt))
+        else:
+            self.y = nn.Parameter(0.01 * torch.randn(Da, K, dtype=dt))
 
         # y_hat — maximise
         self.y_hat = nn.Parameter(0.01 * torch.randn(Da, K, dtype=dt))
 
         # z   — minimise   (critic value)
-        self.z = nn.Parameter(torch.zeros(K, dtype=dt))
+        if self.cfg.warm_start:
+            gamma = self.cfg.gamma
+            z_init = torch.zeros(K, dtype=dt)
+            for mu in range(self.M):
+                for n in range(self.Tp):
+                    alpha = mu * self.Tp + n
+                    remaining = self.Tp - n
+                    z_init[alpha] = (1.0 - gamma ** remaining) / (1.0 - gamma)
+            self.z = nn.Parameter(z_init + 0.1 * torch.randn(K, dtype=dt))
+        else:
+            self.z = nn.Parameter(0.1 * torch.randn(K, dtype=dt))
 
         # z_hat — maximise
         self.z_hat = nn.Parameter(torch.zeros(K, dtype=dt))
@@ -175,7 +197,15 @@ class DMFTSolver(nn.Module):
         if Ns is None:
             Ns = self.cfg.N_samples
         Sigma = self._build_covariance()
-        L = torch.linalg.cholesky(Sigma)
+
+        # Robust factorisation: try Cholesky, fall back to eigendecomposition
+        try:
+            L = torch.linalg.cholesky(Sigma)
+        except torch._C._LinAlgError:
+            evals, evecs = torch.linalg.eigh(Sigma)
+            evals = torch.clamp(evals, min=self.cfg.eps_reg * 10.0)
+            L = evecs @ torch.diag(torch.sqrt(evals))   # Sigma ≈ L @ L^T
+
         return torch.randn(Ns, self.K, dtype=Sigma.dtype, device=Sigma.device) @ L.T
 
     def _forward_dynamics(self, eta):
@@ -199,66 +229,93 @@ class DMFTSolver(nn.Module):
 
     # =========================================================
     #  Manual gradients of  -ln W
+    #
+    #  ALL operations here MUST run inside torch.no_grad()
+    #  to avoid leaking massive autograd graphs (Ns×K×K
+    #  tensors tracing through nn.Parameters).  The gradient
+    #  formulas are analytic (Price's theorem / direct
+    #  differentiation of O), so no autograd is needed.
     # =========================================================
     def _compute_lnW_gradients(self, eta, h, phi, O):
-        dt  = self.cfg.dt
-        g   = self.cfg.g
-        Da  = self.Da
-        K   = self.K
-        Ns  = O.shape[0]
+        """
+        Returns (neg_ln_W, grad_C, grad_C_hat, grad_y_hat)
+        — all plain tensors (no grad_fn).  Batched computation
+        caps memory at ~ batch_size × K × K.
+        """
+        with torch.no_grad():
+            dt  = self.cfg.dt
+            g   = self.cfg.g
+            Da  = self.Da
+            K   = self.K
+            Ns  = O.shape[0]
 
-        # ----- softmax weights (log‑sum‑exp) -----
-        O_max       = O.max()
-        O_shifted   = O - O_max
-        log_sum_exp = O_max + torch.log(torch.sum(torch.exp(O_shifted)) + 1e-30)
-        neg_ln_W    = math.log(Ns) - log_sum_exp
+            # ----- softmax weights (log‑sum‑exp) -----
+            O_max       = O.max()
+            O_shifted   = O - O_max
+            log_sum_exp = O_max + torch.log(torch.sum(torch.exp(O_shifted)) + 1e-30)
+            neg_ln_W    = math.log(Ns) - log_sum_exp
 
-        w = torch.softmax(O, dim=0)                     # (Ns,)
+            w = torch.softmax(O, dim=0)                     # (Ns,)
 
-        # ----- grad_C_hat  = -(Δt²/2) ⟨φ φᵀ⟩_W -----
-        grad_C_hat = -0.5 * dt * dt * torch.einsum('s,si,sj->ij', w, phi, phi)
+            # ----- grad_C_hat  = -(Δt²/2) ⟨φ φᵀ⟩_W -----
+            grad_C_hat = -0.5 * dt * dt * torch.einsum('s,si,sj->ij', w, phi, phi)
 
-        # ----- grad_y_hat  = -Δt² ⟨(ŷ_i·h) h⟩_W -----
-        yh = self.y_hat @ h.T                           # (Da, Ns)
-        grad_y_hat = torch.zeros(Da, K, dtype=self.y_hat.dtype)
-        for i in range(Da):
-            grad_y_hat[i] = -dt * dt * (h * (w * yh[i]).unsqueeze(-1)).sum(dim=0)
+            # ----- grad_y_hat  = -Δt² ⟨(ŷ_i·h) h⟩_W -----
+            yh = self.y_hat.data @ h.T                     # (Da, Ns)  — use .data
+            grad_y_hat = torch.zeros(Da, K, dtype=self.y_hat.dtype)
+            for i in range(Da):
+                grad_y_hat[i] = -dt * dt * (h * (w * yh[i]).unsqueeze(-1)).sum(dim=0)
 
-        # ----- grad_C  (core — uses response matrix R) -----
-        phi_prime  = 1.0 - phi ** 2
-        phi_dprime = -2.0 * phi * phi_prime
+            # ----- grad_C  (core — batched to limit memory) -----
+            H0 = dt * dt * (self.y_hat.data.T @ self.y_hat.data)   # (K, K)
 
-        C_hat_phi = (self.C_hat @ phi.T).T               # (Ns, K)
+            grad_C = torch.zeros(K, K, dtype=self.C.dtype)
 
-        # u = Δt² [ Σ_i ŷ_i (ŷ_i·h) + φ′ ⊙ (Ĉ φ) ]
-        y_term = (self.y_hat.T @ yh).T                    # (Ns, K)
-        u = dt * dt * (y_term + phi_prime * C_hat_phi)   # (Ns, K)
+            BATCH = 400   # process 400 samples at a time → ~12 MB per (B,K,K)
+            for start in range(0, Ns, BATCH):
+                end = min(start + BATCH, Ns)
+                B = end - start
 
-        # H = Δt² [ Σ_i ŷ_i ŷ_iᵀ  +  diag(φ′) Ĉ diag(φ′)  +  diag(φ″ ⊙ (Ĉ φ)) ]
-        H0 = dt * dt * (self.y_hat.T @ self.y_hat)        # (K, K)
+                h_b   = h[start:end]                       # (B, K)
+                phi_b = phi[start:end]
+                w_b   = w[start:end]                       # (B,)
 
-        H1 = dt * dt * (phi_prime.unsqueeze(-1) *
-                        self.C_hat.unsqueeze(0) *
-                        phi_prime.unsqueeze(1))           # (Ns, K, K)
+                phi_prime_b  = 1.0 - phi_b ** 2
+                phi_dprime_b = -2.0 * phi_b * phi_prime_b
 
-        d_s  = phi_dprime * C_hat_phi
-        H2   = dt * dt * torch.diag_embed(d_s)             # (Ns, K, K)
+                C_hat_phi_b = phi_b @ self.C_hat.data.T    # (B, K)  (Ĉ is symmetric)
 
-        H_s  = H0.unsqueeze(0) + H1 + H2
+                # u = Δt² [ Σ_i ŷ_i (ŷ_i·h) + φ′ ⊙ (Ĉ φ) ]
+                yh_b    = self.y_hat.data @ h_b.T          # (Da, B)
+                y_term_b = (self.y_hat.data.T @ yh_b).T    # (B, K)
+                u_b = dt * dt * (y_term_b + phi_prime_b * C_hat_phi_b)
 
-        # Rᵀ H_s R   (batched matmul)
-        R3   = self.R.unsqueeze(0).expand(Ns, -1, -1)
-        RT3  = self.R.T.unsqueeze(0).expand(Ns, -1, -1)
-        step1 = torch.bmm(H_s, R3)                         # H_s @ R
-        RTHR  = torch.bmm(RT3, step1)                      # Rᵀ @ (H_s @ R)
+                # H1:  diag(φ′) Ĉ diag(φ′)
+                H1_b = dt * dt * (phi_prime_b.unsqueeze(-1) *
+                                  self.C_hat.data.unsqueeze(0) *
+                                  phi_prime_b.unsqueeze(1))  # (B, K, K)
 
-        # (Rᵀ u_s)(Rᵀ u_s)ᵀ
-        RTu       = u @ self.R
-        RTu_outer = torch.bmm(RTu.unsqueeze(-1), RTu.unsqueeze(1))
+                # H2:  diag(φ″ ⊙ (Ĉ φ))
+                d_s_b  = phi_dprime_b * C_hat_phi_b
+                H2_b   = dt * dt * torch.diag_embed(d_s_b)  # (B, K, K)
 
-        per_sample = RTHR + RTu_outer
-        weighted   = torch.einsum('s,sij->ij', w, per_sample)
-        grad_C     = -0.5 * g * g * weighted
+                H_b = H0.unsqueeze(0) + H1_b + H2_b
+
+                # Rᵀ H_b R   (batched matmul)
+                R_T = self.R.T                              # (K, K)
+                step1_b = torch.bmm(H_b, self.R.unsqueeze(0).expand(B, -1, -1))
+                RTHR_b  = torch.bmm(R_T.unsqueeze(0).expand(B, -1, -1), step1_b)
+
+                # (Rᵀ u_s)(Rᵀ u_s)ᵀ
+                RTu_b       = u_b @ self.R
+                RTu_outer_b = torch.bmm(RTu_b.unsqueeze(-1), RTu_b.unsqueeze(1))
+
+                per_sample_b = RTHR_b + RTu_outer_b
+                grad_C += torch.einsum('b,bij->ij', w_b, per_sample_b)
+
+                del H_b, H1_b, H2_b, step1_b, RTHR_b, RTu_outer_b, per_sample_b
+
+            grad_C *= -0.5 * g * g
 
         return neg_ln_W, grad_C, grad_C_hat, grad_y_hat
 
@@ -326,13 +383,14 @@ class DMFTSolver(nn.Module):
         """One forward pass → returns S_total (float), grads (dict)."""
         self.zero_all_grads()
 
-        # 1. MC samples for W
-        eta = self._sample_eta(N_samples)
-        h, phi = self._forward_dynamics(eta)
-        O = self._compute_O(h, phi)
+        # 1. MC samples for W  (no autograd needed; analytic formulas)
+        with torch.no_grad():
+            eta = self._sample_eta(N_samples)
+            h, phi = self._forward_dynamics(eta)
+            O = self._compute_O(h, phi)
 
-        # 2. Manual −ln W gradients
-        neg_ln_W, gC_W, gCh_W, gyh_W = self._compute_lnW_gradients(eta, h, phi, O)
+            # 2. Manual −ln W gradients (already in no_grad internally)
+            neg_ln_W, gC_W, gCh_W, gyh_W = self._compute_lnW_gradients(eta, h, phi, O)
 
         # 3. Autograd:  S_quad + S_RL
         S_qr = self._compute_S_quad_RL()
@@ -542,14 +600,314 @@ class DMFTSolver(nn.Module):
 
 
 # ============================================================
-#  Main:   verification
+#  DMFT Minimax Optimizer
+# ============================================================
+class DMFTMinimaxOptimizer:
+    """
+    Saddle-point minimax optimisation for the DMFT action S.
+
+    Three update schemes (algorithm.tex §2):
+
+      - 'diag'      — standard minimax: each variable uses its own gradient
+      - 'off_diag'  — cross-coupled for every pair (C↔Ĉ, y↔ŷ, z↔ẑ).
+                       NOTE: this fails for (y,ŷ) because ∂S/∂ŷ lacks the
+                       RL policy gradient.  Use only for (C,Ĉ) tests.
+      - 'mixed'     — off‑diag for (C,Ĉ); diag for (y,ŷ) and (z,ẑ).
+                       **Recommended for full saddle‑point search.**
+
+    Adaptive step sizes via element‑wise Adam (separate state per
+    parameter), which naturally handles the 12‑order‑of‑magnitude
+    gradient scale disparity without distorting matrix structure.
+    """
+
+    def __init__(self, solver, scheme='mixed',
+                 lr=None, adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8):
+        """
+        Args:
+            solver:      DMFTSolver instance
+            scheme:      'diag', 'off_diag', or 'mixed'
+            lr:          dict of per‑variable base learning rates
+            adam_beta1:  Adam β₁ (momentum)
+            adam_beta2:  Adam β₂ (RMS)
+            adam_eps:    Adam ε
+        """
+        self.solver  = solver
+        self.scheme  = scheme
+        self.beta1   = adam_beta1
+        self.beta2   = adam_beta2
+        self.eps     = adam_eps
+
+        self._minimise = {'C', 'y', 'z'}
+        self._maximise = {'C_hat', 'y_hat', 'z_hat'}
+        self._all_vars = ['C','C_hat','y','y_hat','z','z_hat']
+
+        # Cross‑coupling map for off‑diagonal
+        self._conjugate = {
+            'C': 'C_hat', 'C_hat': 'C',
+            'y': 'y_hat', 'y_hat': 'y',
+            'z': 'z_hat', 'z_hat': 'z',
+        }
+
+        # Which scheme applies per variable:
+        #  'diag'    → use own gradient
+        #  'off_diag' → use conjugate's gradient
+        if scheme == 'diag':
+            self._grad_source = {n: n for n in self._all_vars}
+        elif scheme == 'off_diag':
+            self._grad_source = {n: self._conjugate[n] for n in self._all_vars}
+        else:  # 'mixed'
+            self._grad_source = {
+                'C':     'C_hat',   # off‑diag: C ← −∂S/∂Ĉ
+                'C_hat': 'C',       # off‑diag: Ĉ ← +∂S/∂C
+                'y':     'y',       # diag
+                'y_hat': 'y_hat',   # diag
+                'z':     'z',       # diag
+                'z_hat': 'z_hat',   # diag
+            }
+
+        # Sign:  minimise → −  ;  maximise → +
+        self._sign = {n: (-1.0 if n in self._minimise else +1.0)
+                      for n in self._all_vars}
+
+        # Adam state  (m, v, t  per parameter)
+        self._m = {n: None for n in self._all_vars}
+        self._v = {n: None for n in self._all_vars}
+        self._t = {n: 0    for n in self._all_vars}
+
+        # Default learning rates  (per‑element step size ~ lr)
+        if lr is None:
+            self.lr = {
+                'C':      5e-4,
+                'C_hat':  5e-4,
+                'y':      5e-7,
+                'y_hat':  5e-4,
+                'z':      2e-3,
+                'z_hat':  5e-4,
+            }
+        else:
+            self.lr = lr
+
+        self.history = []
+
+    # ---------------------------------------------------------
+    #  One iteration
+    # ---------------------------------------------------------
+    def step(self, N_samples=None):
+        S_val, grads = self.solver.compute_S_and_gradients(N_samples)
+
+        with torch.no_grad():
+            for name in self._all_vars:
+                src = self._grad_source[name]
+                g = grads.get(src)
+                if g is None:
+                    continue
+
+                sign = self._sign[name]
+                self._t[name] += 1
+                t = self._t[name]
+
+                # ---- Adam update (element‑wise) ----
+                if self._m[name] is None:
+                    self._m[name] = torch.zeros_like(g)
+                    self._v[name] = torch.zeros_like(g)
+
+                b1, b2 = self.beta1, self.beta2
+                self._m[name] = b1 * self._m[name] + (1.0 - b1) * g
+                self._v[name] = b2 * self._v[name] + (1.0 - b2) * (g ** 2)
+
+                m_hat = self._m[name] / (1.0 - b1 ** t)
+                v_hat = self._v[name] / (1.0 - b2 ** t)
+
+                update = m_hat / (torch.sqrt(v_hat) + self.eps)
+
+                # Apply
+                param = getattr(self.solver, name)
+                param.data += sign * self.lr[name] * update
+
+        return S_val, grads
+
+    # ---------------------------------------------------------
+    #  Diagnostics
+    # ---------------------------------------------------------
+    def _compute_policy_accuracy(self):
+        """Fraction of (μ,n) where argmax π matches target."""
+        with torch.no_grad():
+            probs = self.solver.psi(self.solver.y.T)   # (K, Da)
+            preds = probs.argmax(dim=-1)                # (K,)
+
+            K = self.solver.K
+            T = self.solver.Tp
+            targets_tiled = []
+            for mu, tgt in enumerate(self.solver.targets):
+                targets_tiled.extend([tgt] * T)
+            targets_t = torch.tensor(targets_tiled, dtype=torch.long)
+
+            correct = (preds == targets_t).sum().item()
+        return correct / K
+
+    def _compute_value_stats(self):
+        """Min/mean/max of z per trajectory."""
+        with torch.no_grad():
+            z = self.solver.z.view(self.solver.M, self.solver.Tp)
+            stats = {}
+            for mu in range(self.solver.M):
+                stats[f'z_{mu}'] = (z[mu].min().item(),
+                                    z[mu].mean().item(),
+                                    z[mu].max().item())
+        return stats
+
+    def _compute_correlation_gap(self):
+        """‖C − ⟨φ·φᵀ⟩_W‖ / ‖C‖  — saddle‑point condition."""
+        with torch.no_grad():
+            torch.manual_seed(777)
+            eta = self.solver._sample_eta(self.solver.cfg.N_samples)
+            h, phi = self.solver._forward_dynamics(eta)
+            O = self.solver._compute_O(h, phi)
+            w = torch.softmax(O, dim=0)
+            phi_corr = torch.einsum('s,si,sj->ij', w, phi, phi)
+            gap = (self.solver.C.data - phi_corr).norm()
+            rel_gap = gap / (self.solver.C.data.norm() + 1e-30)
+        return gap.item(), rel_gap.item()
+
+    # ---------------------------------------------------------
+    #  Full optimisation loop
+    # ---------------------------------------------------------
+    def run(self, max_iter=2000,
+            tol_grad=1e-3,
+            N_samples_start=None, N_samples_end=None,
+            verbose=True, log_interval=50):
+        """
+        Run the minimax DMFT loop.
+
+        Args:
+            max_iter:         maximum iterations
+            tol_grad:         stop when smoothed max |g| < this
+            N_samples_start:  initial MC samples (default: cfg.N_samples)
+            N_samples_end:    final MC samples (gradually increased; default: same)
+            verbose:          print progress
+            log_interval:     print every N steps
+
+        Returns:
+            self.history  (list of dicts)
+        """
+        if N_samples_start is None:
+            N_samples_start = self.solver.cfg.N_samples
+        if N_samples_end is None:
+            N_samples_end = N_samples_start
+
+        self.history = []
+        S_prev = None
+        max_gn_ema = None
+        gn_beta = 0.95
+        n_stalled = 0
+
+        # header
+        if verbose:
+            print(f"\n{'='*78}")
+            print(f"  DMFT Minimax Optimisation  —  scheme={self.scheme}")
+            print(f"  max_iter={max_iter}  tol_grad={tol_grad}")
+            print(f"  Adam lr = {{{', '.join(f'{k}:{v}' for k,v in self.lr.items())}}}")
+            print(f"  N_samples: {N_samples_start} → {N_samples_end}")
+            print(f"{'='*78}")
+            hdr = (f"{'iter':>5s}  {'S':>14s}  "
+                   f"{'|g_C|':>8s}  {'|g_Ch|':>9s}  "
+                   f"{'|g_y|':>9s}  {'|g_yh|':>9s}  "
+                   f"{'|g_z|':>9s}  {'|g_zh|':>9s}  "
+                   f"{'acc':>6s}  {'ΔS':>9s}")
+            print(hdr)
+            print("-" * len(hdr))
+
+        for it in range(max_iter):
+            # adaptive N_samples  (linear schedule)
+            if N_samples_end != N_samples_start:
+                frac = it / max(1, max_iter - 1)
+                Ns = int(N_samples_start + frac * (N_samples_end - N_samples_start))
+            else:
+                Ns = N_samples_start
+
+            S_val, grads = self.step(N_samples=Ns)
+
+            # gradient norms
+            gn = {n: g.norm().item() if g is not None else 0.0
+                  for n, g in grads.items()}
+            max_gn = max(gn.values())
+
+            # smoothed max gradient
+            if max_gn_ema is None:
+                max_gn_ema = max_gn
+            else:
+                max_gn_ema = gn_beta * max_gn_ema + (1.0 - gn_beta) * max_gn
+
+            # S change
+            dS = (S_val - S_prev) if S_prev is not None else 0.0
+
+            # diagnostics
+            acc = self._compute_policy_accuracy()
+
+            entry = {
+                'iter': it,
+                'S':    S_val,
+                'grad_norms': gn,
+                'max_grad': max_gn,
+                'max_grad_ema': max_gn_ema,
+                'dS': dS,
+                'acc': acc,
+            }
+            self.history.append(entry)
+            S_prev = S_val
+
+            # verbose
+            if verbose and (it % log_interval == 0 or it == 0):
+                print(f"{it:5d}  {S_val:14.6e}  "
+                      f"{gn['C']:8.2e}  {gn['C_hat']:9.2e}  "
+                      f"{gn['y']:9.2e}  {gn['y_hat']:9.2e}  "
+                      f"{gn['z']:9.2e}  {gn['z_hat']:9.2e}  "
+                      f"{acc:6.4f}  {dS:+.4e}")
+
+            # convergence: smoothed max|g| below tolerance
+            if max_gn_ema < tol_grad:
+                n_stalled += 1
+            else:
+                n_stalled = max(0, n_stalled - 1)
+
+            if n_stalled >= 10:
+                if verbose:
+                    print(f"  Converged at iter {it}:  "
+                          f"smoothed max|g| = {max_gn_ema:.2e}")
+                break
+
+        if verbose:
+            print(f"\n  Final:  S = {S_val:.8e}  "
+                  f"acc = {acc:.4f}  max|g| = {max_gn:.4e}  "
+                  f"smoothed max|g| = {max_gn_ema:.4e}")
+            # value stats
+            vz = self._compute_value_stats()
+            for mu in range(self.solver.M):
+                mn, av, mx = vz[f'z_{mu}']
+                print(f"    z traj {mu}:  min={mn:.4f}  mean={av:.4f}  max={mx:.4f}")
+            # correlation gap
+            gap, rel_gap = self._compute_correlation_gap()
+            print(f"    ‖C − ⟨φ·φᵀ⟩_W‖ / ‖C‖ = {rel_gap:.4e}")
+
+        return self.history
+
+
+# ============================================================
+#  Main:   verification  +  optional optimisation run
 # ============================================================
 if __name__ == '__main__':
+    import sys
+
+    run_opt = '--optimize' in sys.argv or '-o' in sys.argv
+
     print("="*60)
-    print("  DMFT Solver — Gradient Verification")
+    if run_opt:
+        print("  DMFT Solver — Optimisation")
+    else:
+        print("  DMFT Solver — Gradient Verification")
     print("="*60)
 
-    cfg = DMFTConfig(N_samples=4000, dtype=torch.float64)
+    cfg = DMFTConfig(N_samples=2000, dtype=torch.float64)
     torch.set_default_dtype(torch.float64)
     torch.manual_seed(42)
 
@@ -562,96 +920,137 @@ if __name__ == '__main__':
           f"c_p={cfg.c_p}, c_v={cfg.c_v}, β={cfg.beta}")
     print(f"  MC samples = {cfg.N_samples}")
 
-    # ---- 1. Evaluate S ----
-    print("\n--- (a)  S evaluation ---")
-    S0, grads = solver.compute_S_and_gradients()
-    print(f"  S_total = {S0:.8e}")
-    for n, g in grads.items():
-        gn = g.norm().item() if g is not None else 0.0
-        print(f"    |grad_{n}| = {gn:.4e}")
+    if not run_opt:
+        # ---- 1. Evaluate S ----
+        print("\n--- (a)  S evaluation ---")
+        S0, grads = solver.compute_S_and_gradients()
+        print(f"  S_total = {S0:.8e}")
+        for n, g in grads.items():
+            gn = g.norm().item() if g is not None else 0.0
+            print(f"    |grad_{n}| = {gn:.4e}")
 
-    # ---- 2. Verify S_quad + S_RL (deterministic, no noise) ----
-    solver.verify_S_quad_RL_gradients(eps=1e-5)
+        # ---- 2. Verify S_quad + S_RL (deterministic, no noise) ----
+        solver.verify_S_quad_RL_gradients(eps=1e-5)
 
-    # ---- 3. Verify S_RL y‑gradient at finer resolution ----
-    solver.verify_y_gradient_basic(eps=1e-7)
+        # ---- 3. Verify S_RL y‑gradient at finer resolution ----
+        solver.verify_y_gradient_basic(eps=1e-7)
 
-    # ---- 4. Full‑S directional check ----
-    solver.verify_full_S_directions()
+        # ---- 4. Full‑S directional check ----
+        solver.verify_full_S_directions()
 
-    # ---- 5. Self‑consistency: ∂S/∂Ĉ ?= (Δt²/2)(C − ⟨φ·φᵀ⟩_W) ----
-    print("\n" + "="*58)
-    print("  Self‑consistency check:  ∂S/∂Ĉ  vs  (Δt²/2) (C − ⟨φ·φᵀ⟩_W)")
-    print("="*58)
-
-    # re‑run MC at current parameters with a fixed seed  (no‑grad)
-    with torch.no_grad():
-        torch.manual_seed(777)
-        eta_test = solver._sample_eta(cfg.N_samples)
-        h_test, phi_test = solver._forward_dynamics(eta_test)
-        O_test = solver._compute_O(h_test, phi_test)
-
-        Ns = O_test.shape[0]
-        w_test = torch.softmax(O_test, dim=0)
-        phi_corr_W = torch.einsum('s,si,sj->ij', w_test, phi_test, phi_test)  # (K,K)
-
-        # manual W gradients (these are fine inside no_grad)
-        _, gC_W, Ch_W, yh_W = solver._compute_lnW_gradients(eta_test, h_test, phi_test, O_test)
-
-    # Now compute autograd part (outside no_grad)
-    solver.zero_all_grads()
-    S_qr = solver._compute_S_quad_RL()
-    S_qr.backward()
-    # total ∂S/∂Ĉ = autograd ∂S_qr/∂Ĉ  +  manual ∂(−ln W)/∂Ĉ
-    gCh_total = solver.C_hat.grad.detach().clone() + Ch_W
-
-    dt = cfg.dt
-    # Prediction:  ∂S/∂Ĉ = (Δt²/2) C − (Δt²/2) ⟨φ·φᵀ⟩_W
-    pred_gCh = 0.5 * dt * dt * (solver.C.data - phi_corr_W)
-    diff_norm = (gCh_total - pred_gCh).norm()
-    pred_norm = pred_gCh.norm()
-    rel_err = (diff_norm / (pred_norm + 1e-30)).item()
-
-    print(f"  ‖∂S/∂Ĉ (computed) − pred‖ / ‖pred‖ = {rel_err:.2e}")
-    print(f"  ‖∂S/∂Ĉ (computed)‖ = {gCh_total.norm().item():.6e}")
-    print(f"  ‖∂S/∂Ĉ (predicted)‖ = {pred_gCh.norm().item():.6e}")
-    print(f"  ‖(Δt²/2) C‖          = {0.5*dt*dt*solver.C.data.norm().item():.6e}")
-    print(f"  ‖(Δt²/2) ⟨φ·φᵀ⟩_W‖  = {0.5*dt*dt*phi_corr_W.norm().item():.6e}")
-    if rel_err < 1e-4:
-        print(f"  ✓  Self‑consistency PASSED  (rel err = {rel_err:.2e})")
-    else:
-        print(f"  ✗  Self‑consistency FAILED  (rel err = {rel_err:.2e})")
-
-    solver.zero_all_grads()
-
-    # ---- 6. DMFT gradient step: check S changes correctly ----
-    print("\n" + "="*58)
-    print("  DMFT gradient‑step test (few iterations)")
-    print("="*58)
-    # Run a few update steps with small learning rates
-    lr_min  = {'C': 5e-3,  'y': 5e-7,  'z': 5e-6}
-    lr_max  = {'C_hat': 5e-3, 'y_hat': 5e-4, 'z_hat': 5e-4}
-
-    S_prev = solver.compute_S_and_gradients()[0]
-    print(f"  Initial S = {S_prev:.8e}")
-
-    for step in range(5):
-        S_val, grads = solver.compute_S_and_gradients()
+        # ---- 5. Self‑consistency: ∂S/∂Ĉ ?= (Δt²/2)(C − ⟨φ·φᵀ⟩_W) ----
+        print("\n" + "="*58)
+        print("  Self‑consistency check:  ∂S/∂Ĉ  vs  (Δt²/2) (C − ⟨φ·φᵀ⟩_W)")
+        print("="*58)
 
         with torch.no_grad():
-            for name in ['C','C_hat','y','y_hat','z','z_hat']:
-                g = grads[name]
-                if g is None:
-                    continue
-                p = getattr(solver, name)
-                if name in lr_min:
-                    p.data -= lr_min[name] * g      # minimise
-                else:
-                    p.data += lr_max[name] * g       # maximise
+            torch.manual_seed(777)
+            eta_test = solver._sample_eta(cfg.N_samples)
+            h_test, phi_test = solver._forward_dynamics(eta_test)
+            O_test = solver._compute_O(h_test, phi_test)
 
-        print(f"  Step {step+1}: S = {S_val:.8e}")
+            Ns = O_test.shape[0]
+            w_test = torch.softmax(O_test, dim=0)
+            phi_corr_W = torch.einsum('s,si,sj->ij', w_test, phi_test, phi_test)
 
-    print(f"  ΔS after {step+1} steps = {S_val - S_prev:+.6e}")
-    print(f"  (S should decrease for minimax:  min_C,y,z  max_Ĉ,ŷ,ẑ)")
+            _, gC_W, Ch_W, yh_W = solver._compute_lnW_gradients(eta_test, h_test, phi_test, O_test)
 
-    print("\nDone.")
+        solver.zero_all_grads()
+        S_qr = solver._compute_S_quad_RL()
+        S_qr.backward()
+        gCh_total = solver.C_hat.grad.detach().clone() + Ch_W
+
+        dt = cfg.dt
+        pred_gCh = 0.5 * dt * dt * (solver.C.data - phi_corr_W)
+        diff_norm = (gCh_total - pred_gCh).norm()
+        pred_norm = pred_gCh.norm()
+        rel_err = (diff_norm / (pred_norm + 1e-30)).item()
+
+        print(f"  ‖∂S/∂Ĉ (computed) − pred‖ / ‖pred‖ = {rel_err:.2e}")
+        print(f"  ‖∂S/∂Ĉ (computed)‖ = {gCh_total.norm().item():.6e}")
+        print(f"  ‖∂S/∂Ĉ (predicted)‖ = {pred_gCh.norm().item():.6e}")
+        print(f"  ‖(Δt²/2) C‖          = {0.5*dt*dt*solver.C.data.norm().item():.6e}")
+        print(f"  ‖(Δt²/2) ⟨φ·φᵀ⟩_W‖  = {0.5*dt*dt*phi_corr_W.norm().item():.6e}")
+        if rel_err < 1e-4:
+            print(f"  ✓  Self‑consistency PASSED  (rel err = {rel_err:.2e})")
+        else:
+            print(f"  ✗  Self‑consistency FAILED  (rel err = {rel_err:.2e})")
+
+        solver.zero_all_grads()
+
+        # ---- 6. DMFT gradient step: check S changes correctly ----
+        print("\n" + "="*58)
+        print("  DMFT gradient‑step test (few iterations)")
+        print("="*58)
+        lr_min  = {'C': 5e-3,  'y': 5e-7,  'z': 5e-6}
+        lr_max  = {'C_hat': 5e-3, 'y_hat': 5e-4, 'z_hat': 5e-4}
+
+        S_prev = solver.compute_S_and_gradients()[0]
+        print(f"  Initial S = {S_prev:.8e}")
+
+        for step in range(5):
+            S_val, grads = solver.compute_S_and_gradients()
+
+            with torch.no_grad():
+                for name in ['C','C_hat','y','y_hat','z','z_hat']:
+                    g = grads[name]
+                    if g is None:
+                        continue
+                    p = getattr(solver, name)
+                    if name in lr_min:
+                        p.data -= lr_min[name] * g
+                    else:
+                        p.data += lr_max[name] * g
+
+            print(f"  Step {step+1}: S = {S_val:.8e}")
+
+        print(f"  ΔS after {step+1} steps = {S_val - S_prev:+.6e}")
+        print(f"  (S should decrease for minimax:  min_C,y,z  max_Ĉ,ŷ,ẑ)")
+
+        print("\nDone.")
+        print("  (use  python dmft_solver.py --optimize  to run full DMFT saddle-point search)")
+
+    else:
+        # ====================================================
+        #  Full DMFT optimisation
+        # ====================================================
+        scheme = 'mixed'
+        print(f"\n  Using scheme: {scheme}")
+
+        # lr overrides can be passed:  --lr C=1e-3,y=1e-6,z=5e-3
+        lr_override = {}
+        for arg in sys.argv[1:]:
+            if '=' in arg and not arg.startswith('--lr'):
+                # try to parse key=value pairs
+                parts = arg.split('=')
+                if len(parts) == 2:
+                    try:
+                        lr_override[parts[0]] = float(parts[1])
+                    except ValueError:
+                        pass
+
+        lr = None
+        if lr_override:
+            lr = lr_override
+            # fill defaults for missing
+            defaults = {'C':5e-4, 'C_hat':5e-4, 'y':5e-7, 'y_hat':5e-4,
+                        'z':2e-3, 'z_hat':5e-4}
+            for k, v in defaults.items():
+                if k not in lr:
+                    lr[k] = v
+        else:
+            lr = {'C':5e-4, 'C_hat':5e-4, 'y':5e-7, 'y_hat':5e-4,
+                  'z':2e-3, 'z_hat':5e-4}
+
+        opt = DMFTMinimaxOptimizer(solver, scheme=scheme, lr=lr)
+
+        history = opt.run(
+            max_iter=2000,
+            tol_grad=1e-3,
+            N_samples_start=2000,
+            N_samples_end=4000,
+            verbose=True,
+            log_interval=50,
+        )
+
+        print("\nDone.")

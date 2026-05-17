@@ -769,36 +769,116 @@ class DMFTMinimaxOptimizer:
         return gap.item(), rel_gap.item()
 
     # ---------------------------------------------------------
+    #  Checkpoint save / load
+    # ---------------------------------------------------------
+    def _get_run_state(self, S_prev, max_gn_ema, n_stalled):
+        return {
+            'S_prev':     S_prev,
+            'max_gn_ema': max_gn_ema,
+            'n_stalled':  n_stalled,
+        }
+
+    def save_checkpoint(self, filepath, iteration, S_prev, max_gn_ema, n_stalled):
+        import os
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        checkpoint = {
+            'iteration':  iteration,
+            'params':     {n: getattr(self.solver, n).data.detach().cpu().clone()
+                           for n in self._all_vars},
+            'adam_m':     {n: (self._m[n].detach().cpu().clone()
+                               if self._m[n] is not None else None)
+                           for n in self._all_vars},
+            'adam_v':     {n: (self._v[n].detach().cpu().clone()
+                               if self._v[n] is not None else None)
+                           for n in self._all_vars},
+            'adam_t':     self._t.copy(),
+            'history':    self.history,
+            'run_state':  self._get_run_state(S_prev, max_gn_ema, n_stalled),
+        }
+
+        tmp = filepath + '.tmp'
+        torch.save(checkpoint, tmp)
+        os.replace(tmp, filepath)
+
+    def load_checkpoint(self, filepath):
+        ckpt = torch.load(filepath, map_location='cpu', weights_only=False)
+        device = self.solver.C.device
+        dtype  = self.solver.C.dtype
+
+        for n in self._all_vars:
+            p = getattr(self.solver, n)
+            p.data.copy_(ckpt['params'][n].to(device, dtype))
+
+        for n in self._all_vars:
+            if ckpt['adam_m'][n] is not None:
+                self._m[n] = ckpt['adam_m'][n].to(device, dtype)
+                self._v[n] = ckpt['adam_v'][n].to(device, dtype)
+            else:
+                self._m[n] = None
+                self._v[n] = None
+
+        self._t.update(ckpt['adam_t'])
+        self.history = ckpt['history']
+
+        return ckpt
+
+    # ---------------------------------------------------------
     #  Full optimisation loop
     # ---------------------------------------------------------
     def run(self, max_iter=2000,
             tol_grad=1e-3,
             N_samples_start=None, N_samples_end=None,
-            verbose=True, log_interval=50):
+            verbose=True, log_interval=50,
+            checkpoint_dir=None, save_interval=None,
+            resume_checkpoint=None):
         """
         Run the minimax DMFT loop.
 
         Args:
-            max_iter:         maximum iterations
-            tol_grad:         stop when smoothed max |g| < this
-            N_samples_start:  initial MC samples (default: cfg.N_samples)
-            N_samples_end:    final MC samples (gradually increased; default: same)
-            verbose:          print progress
-            log_interval:     print every N steps
+            max_iter:          maximum iterations
+            tol_grad:          stop when smoothed max |g| < this
+            N_samples_start:   initial MC samples (default: cfg.N_samples)
+            N_samples_end:     final MC samples (default: same)
+            verbose:           print progress
+            log_interval:      print every N steps
+            checkpoint_dir:    directory for saving checkpoints (None = no save)
+            save_interval:     save checkpoint every N iterations
+            resume_checkpoint: checkpoint dict from load_checkpoint() to resume
 
         Returns:
             self.history  (list of dicts)
         """
+        import os
+
         if N_samples_start is None:
             N_samples_start = self.solver.cfg.N_samples
         if N_samples_end is None:
             N_samples_end = N_samples_start
 
-        self.history = []
-        S_prev = None
-        max_gn_ema = None
+        # --- Resume logic ---
+        start_iter = 0
+        if resume_checkpoint is not None:
+            start_iter = resume_checkpoint['iteration'] + 1
+            rs = resume_checkpoint['run_state']
+            S_prev     = rs['S_prev']
+            max_gn_ema = rs['max_gn_ema']
+            n_stalled  = rs['n_stalled']
+            if verbose:
+                print(f"\n  Resumed from iteration {resume_checkpoint['iteration']}")
+        else:
+            self.history = []
+            S_prev = None
+            max_gn_ema = None
+            n_stalled = 0
+
         gn_beta = 0.95
-        n_stalled = 0
+        it = start_iter  # ensure 'it' is defined for except/finally blocks
+
+        if start_iter >= max_iter:
+            if verbose:
+                print(f"  All {max_iter} iterations already completed — nothing to do.")
+            return self.history
 
         # header
         if verbose:
@@ -807,6 +887,8 @@ class DMFTMinimaxOptimizer:
             print(f"  max_iter={max_iter}  tol_grad={tol_grad}")
             print(f"  Adam lr = {{{', '.join(f'{k}:{v}' for k,v in self.lr.items())}}}")
             print(f"  N_samples: {N_samples_start} → {N_samples_end}")
+            if resume_checkpoint is not None:
+                print(f"  Resuming from iter {resume_checkpoint['iteration']}")
             print(f"{'='*78}")
             hdr = (f"{'iter':>5s}  {'S':>14s}  "
                    f"{'|g_C|':>8s}  {'|g_Ch|':>9s}  "
@@ -816,66 +898,95 @@ class DMFTMinimaxOptimizer:
             print(hdr)
             print("-" * len(hdr))
 
-        for it in range(max_iter):
-            # adaptive N_samples  (linear schedule)
-            if N_samples_end != N_samples_start:
-                frac = it / max(1, max_iter - 1)
-                Ns = int(N_samples_start + frac * (N_samples_end - N_samples_start))
-            else:
-                Ns = N_samples_start
+        S_val = None
+        try:
+            for it in range(start_iter, max_iter):
+                # adaptive N_samples  (linear schedule)
+                if N_samples_end != N_samples_start:
+                    frac = it / max(1, max_iter - 1)
+                    Ns = int(N_samples_start + frac * (N_samples_end - N_samples_start))
+                else:
+                    Ns = N_samples_start
 
-            S_val, grads = self.step(N_samples=Ns)
+                S_val, grads = self.step(N_samples=Ns)
 
-            # gradient norms
-            gn = {n: g.norm().item() if g is not None else 0.0
-                  for n, g in grads.items()}
-            max_gn = max(gn.values())
+                # gradient norms
+                gn = {n: g.norm().item() if g is not None else 0.0
+                      for n, g in grads.items()}
+                max_gn = max(gn.values())
 
-            # smoothed max gradient
-            if max_gn_ema is None:
-                max_gn_ema = max_gn
-            else:
-                max_gn_ema = gn_beta * max_gn_ema + (1.0 - gn_beta) * max_gn
+                # smoothed max gradient
+                if max_gn_ema is None:
+                    max_gn_ema = max_gn
+                else:
+                    max_gn_ema = gn_beta * max_gn_ema + (1.0 - gn_beta) * max_gn
 
-            # S change
-            dS = (S_val - S_prev) if S_prev is not None else 0.0
+                # S change
+                dS = (S_val - S_prev) if S_prev is not None else 0.0
 
-            # diagnostics
-            acc = self._compute_policy_accuracy()
+                # diagnostics
+                acc = self._compute_policy_accuracy()
 
-            entry = {
-                'iter': it,
-                'S':    S_val,
-                'grad_norms': gn,
-                'max_grad': max_gn,
-                'max_grad_ema': max_gn_ema,
-                'dS': dS,
-                'acc': acc,
-            }
-            self.history.append(entry)
-            S_prev = S_val
+                entry = {
+                    'iter': it,
+                    'S':    S_val,
+                    'grad_norms': gn,
+                    'max_grad': max_gn,
+                    'max_grad_ema': max_gn_ema,
+                    'dS': dS,
+                    'acc': acc,
+                }
+                self.history.append(entry)
+                S_prev = S_val
 
-            # verbose
-            if verbose and (it % log_interval == 0 or it == 0):
-                print(f"{it:5d}  {S_val:14.6e}  "
-                      f"{gn['C']:8.2e}  {gn['C_hat']:9.2e}  "
-                      f"{gn['y']:9.2e}  {gn['y_hat']:9.2e}  "
-                      f"{gn['z']:9.2e}  {gn['z_hat']:9.2e}  "
-                      f"{acc:6.4f}  {dS:+.4e}")
+                # --- Periodic checkpoint save ---
+                if checkpoint_dir and save_interval and it > start_iter and it % save_interval == 0:
+                    ckpt_path = os.path.join(checkpoint_dir, f'ckpt_{it:06d}.pt')
+                    self.save_checkpoint(ckpt_path, it, S_prev, max_gn_ema, n_stalled)
+                    latest_path = os.path.join(checkpoint_dir, 'ckpt_latest.pt')
+                    self.save_checkpoint(latest_path, it, S_prev, max_gn_ema, n_stalled)
 
-            # convergence: smoothed max|g| below tolerance
-            if max_gn_ema < tol_grad:
-                n_stalled += 1
-            else:
-                n_stalled = max(0, n_stalled - 1)
+                # verbose
+                if verbose and (it % log_interval == 0 or it == start_iter):
+                    print(f"{it:5d}  {S_val:14.6e}  "
+                          f"{gn['C']:8.2e}  {gn['C_hat']:9.2e}  "
+                          f"{gn['y']:9.2e}  {gn['y_hat']:9.2e}  "
+                          f"{gn['z']:9.2e}  {gn['z_hat']:9.2e}  "
+                          f"{acc:6.4f}  {dS:+.4e}")
 
-            if n_stalled >= 10:
+                # convergence: smoothed max|g| below tolerance
+                if max_gn_ema < tol_grad:
+                    n_stalled += 1
+                else:
+                    n_stalled = max(0, n_stalled - 1)
+
+                if n_stalled >= 10:
+                    if verbose:
+                        print(f"  Converged at iter {it}:  "
+                              f"smoothed max|g| = {max_gn_ema:.2e}")
+                    break
+
+        except KeyboardInterrupt:
+            if verbose:
+                print(f"\n  Interrupted at iter {it}.  Saving checkpoint ...")
+            if checkpoint_dir:
+                ckpt_path = os.path.join(checkpoint_dir, f'ckpt_{it:06d}.pt')
+                self.save_checkpoint(ckpt_path, it, S_prev, max_gn_ema, n_stalled)
+                latest_path = os.path.join(checkpoint_dir, 'ckpt_latest.pt')
+                self.save_checkpoint(latest_path, it, S_prev, max_gn_ema, n_stalled)
                 if verbose:
-                    print(f"  Converged at iter {it}:  "
-                          f"smoothed max|g| = {max_gn_ema:.2e}")
-                break
+                    print(f"  Checkpoint saved: {ckpt_path}")
+            raise
 
-        if verbose:
+        if checkpoint_dir and S_val is not None:
+            ckpt_path = os.path.join(checkpoint_dir, f'ckpt_{it:06d}.pt')
+            self.save_checkpoint(ckpt_path, it, S_prev, max_gn_ema, n_stalled)
+            latest_path = os.path.join(checkpoint_dir, 'ckpt_latest.pt')
+            self.save_checkpoint(latest_path, it, S_prev, max_gn_ema, n_stalled)
+            if verbose:
+                print(f"  Final checkpoint saved to {ckpt_path}")
+
+        if verbose and S_val is not None:
             print(f"\n  Final:  S = {S_val:.8e}  "
                   f"acc = {acc:.4f}  max|g| = {max_gn:.4e}  "
                   f"smoothed max|g| = {max_gn_ema:.4e}")

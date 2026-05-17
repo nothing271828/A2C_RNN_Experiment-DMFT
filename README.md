@@ -24,14 +24,37 @@ torch, numpy, matplotlib
 # Run the DMFT solver with gradient verification (self-tests)
 python dmft_solver.py
 
-# Run the DMFT saddle-point optimisation
+# Run the DMFT saddle-point optimisation (built-in)
 python dmft_solver.py --optimize
 
-# Standalone DMFT compute (clean parameter setup + optimisation)
-python compute.py
+# Standalone DMFT compute with checkpoint & resume support
+python compute.py                          # uses default experiment dir
+python compute.py --dir results/my_exp     # specify experiment directory
 
 # Run the neural network experiment (Langevin dynamics training)
 python main.py
+```
+
+## Checkpoint & Resume
+
+Each experiment corresponds to a dedicated directory.  `compute.py` auto‑detects whether the directory exists:
+
+- **New experiment**: creates the directory, saves a full `config.json` with all hyperparameters, then starts the minimax optimisation.
+- **Resume**: loads `config.json` (verifies against current parameters), restores the latest checkpoint (`ckpt_latest.pt`), and continues from the last saved iteration.
+
+Checkpoints are saved:
+- **Periodically**: every `save_interval` iterations (default 50)
+- **On interruption**: if `Ctrl+C` or `SIGTERM` is received, the current state is saved before exit
+- **On completion**: final checkpoint at the last iteration
+
+Directory structure:
+```
+results/my_exp/
+├── config.json          # full hyperparameter record (human‑readable)
+├── ckpt_000050.pt       # periodic checkpoint at iter 50
+├── ckpt_000100.pt       # periodic checkpoint at iter 100
+├── ckpt_latest.pt       # always points to the latest state
+└── ckpt_final.pt        # final state (if completed, currently omitted; see ckpt_latest.pt)
 ```
 
 ## Key Hyperparameters

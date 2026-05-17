@@ -32,7 +32,7 @@ from dmft_solver import (
 # ============================================================
 #  Experiment directory  (change this or pass --dir from CLI)
 # ============================================================
-EXP_DIR = "results/default_experiment"
+EXP_DIR = "results/experiment_1"
 
 
 # ============================================================
@@ -61,9 +61,10 @@ CONFIG = {
 
     # --- DMFT numerics ---
     "dmft_numerics": {
-        "N_samples": 2000,
-        "eps_reg":   1e-6,
-        "dtype":     "torch.float64",
+        "N_samples":  2000,
+        "eps_reg":    1e-6,
+        "dtype":      "torch.float64",
+        "warm_start": True,
     },
 
     # --- Random seeds ---
@@ -74,13 +75,13 @@ CONFIG = {
 
     # --- Optimisation ---
     "optimizer": {
-        "scheme":          "mixed",
-        "max_iter":        2000,
+        "scheme":          "diag",
+        "max_iter":        25000,
         "tol_grad":        1e-3,
         "N_samples_start": 2000,
         "N_samples_end":   4000,
         "log_interval":    50,
-        "save_interval":   50,
+        "save_interval":   200,
         "lr": {
             "C":      5e-4,
             "C_hat":  5e-4,
@@ -175,6 +176,7 @@ def build_solver_and_optimizer(cfg_dict):
         N_samples=dn["N_samples"],
         eps_reg=dn["eps_reg"],
         dtype=dtype,
+        warm_start=dn.get("warm_start", False),
     )
 
     input_seqs, targets = generate_dataset(cfg, seed=rs["data_seed"])

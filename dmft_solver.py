@@ -36,7 +36,6 @@ class DMFTConfig:
 
         # DMFT numerics
         self.N_samples = kwargs.get('N_samples', 2000)
-        self.sigma_U   = kwargs.get('sigma_U', 1.0)
         self.eps_reg   = kwargs.get('eps_reg', 1e-6)
         self.dtype     = kwargs.get('dtype', torch.float64)
         self.warm_start = kwargs.get('warm_start', False)
@@ -110,10 +109,10 @@ class DMFTSolver(nn.Module):
     #  Precomputation helpers
     # ---------------------------------------------------------
     def _precompute_input_covariance(self):
-        """C^I ∈ R^{K×K} :  input-induced noise covariance."""
-        sigma_U = self.cfg.sigma_U
+        """C^I ∈ R^{K×K} :  input‑induced noise covariance.
+        C^I_{μν}(t_n, t_{n'}) = Σ_j s_j^μ(t_n) s_j^ν(t_{n'})"""
         S_flat  = torch.cat(self.input_seqs, dim=0).to(self.cfg.dtype)
-        self.CI = sigma_U * sigma_U * (S_flat @ S_flat.T)
+        self.CI = S_flat @ S_flat.T                          # (K, K)
 
     def _precompute_response_matrix(self):
         """R ∈ R^{K×K} : block‑diagonal response matrix."""

@@ -375,7 +375,7 @@ def plot_training_curves(train_acc_history, test_acc_history, eval_interval, sav
 # ==================== 主程序 ====================
 def main():
     # ---- 实验目录 ----
-    exp_dir = "results/experiment_1_nn"
+    exp_dir = "results/experiment_2_nn"
     for i, arg in enumerate(sys.argv[1:]):
         if arg == "--dir" and i + 2 < len(sys.argv):
             exp_dir = sys.argv[i + 2]
@@ -389,9 +389,9 @@ def main():
 
     # ---- 超参数 ----
     N = 100
-    g = 1.5
+    g = 1
     dt = 0.1
-    c_p = 1
+    c_p = 1.5
     c_v = 1
     gamma_ = 0.95
     D_in = 10
@@ -403,7 +403,7 @@ def main():
     patience = 50
     beta = 10000
     psi_method = 'layer_norm_softmax'
-    psi_tau = 1.0
+    psi_tau = 0.5
 
     seed_everything = 42
     data_seed = 12345

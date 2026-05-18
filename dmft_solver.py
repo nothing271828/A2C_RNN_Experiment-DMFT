@@ -40,27 +40,57 @@ class DMFTConfig:
         self.dtype     = kwargs.get('dtype', torch.float64)
         self.warm_start = kwargs.get('warm_start', False)
 
+        # Psi normalization
+        self.psi_method = kwargs.get('psi_method', 'layer_norm_softmax')
+        self.psi_tau    = kwargs.get('psi_tau', 1.0)
+        self.psi_eps    = kwargs.get('psi_eps', 1e-8)
+        self.psi_alpha  = kwargs.get('psi_alpha', 2.0)
+
         # Derived
         self.K = self.M * self.T
 
 
 # ============================================================
-# PsiNormalization — exactly as in main.py (layer_norm_softmax)
+# PsiNormalization — full version, same as main.py
 # ============================================================
 class PsiNormalization(nn.Module):
-    def __init__(self, eps=1e-8, tau=1.0):
+    def __init__(self, method='layer_norm_softmax', **kwargs):
         super().__init__()
-        self.eps = eps
-        self.tau = tau
+        self.method = method
+
+        if method == 'power':
+            self.eps   = kwargs.get('eps', 1e-8)
+            self.alpha = kwargs.get('alpha', 2.0)
+        elif method == 'layer_norm_softmax':
+            self.eps = kwargs.get('eps', 1e-8)
+            self.tau = kwargs.get('tau', 1.0)
+        elif method == 'softmax':
+            self.tau = kwargs.get('tau', 1.0)
+        else:
+            raise ValueError(f"Unknown PsiNormalization method: {method}")
 
     def forward(self, logits):
-        mean = logits.mean(dim=-1, keepdim=True)
-        var  = ((logits - mean) ** 2).mean(dim=-1, keepdim=True)
-        std  = torch.sqrt(var + self.eps)
-        z    = (logits - mean) / std
-        if self.tau != 1.0:
-            z = z / self.tau
-        return F.softmax(z, dim=-1)
+        if self.method == 'power':
+            m, _ = logits.min(dim=-1, keepdim=True)
+            shifted = logits - m + self.eps
+            powered = shifted.pow(self.alpha)
+            probs = powered / powered.sum(dim=-1, keepdim=True)
+            return probs
+
+        elif self.method == 'layer_norm_softmax':
+            mean = logits.mean(dim=-1, keepdim=True)
+            var  = ((logits - mean) ** 2).mean(dim=-1, keepdim=True)
+            std  = torch.sqrt(var + self.eps)
+            z    = (logits - mean) / std
+            if self.tau != 1.0:
+                z = z / self.tau
+            return F.softmax(z, dim=-1)
+
+        elif self.method == 'softmax':
+            if self.tau != 1.0:
+                logits = logits / self.tau
+            return F.softmax(logits, dim=-1)
+        return None
 
 
 # ============================================================
@@ -103,7 +133,15 @@ class DMFTSolver(nn.Module):
         self._init_parameters()
 
         # ---- Psi normalisation (same as experiment) ----
-        self.psi = PsiNormalization(eps=1e-8, tau=1.0)
+        psi_kwargs = {'eps': cfg.psi_eps}
+        if cfg.psi_method == 'layer_norm_softmax':
+            psi_kwargs['tau'] = cfg.psi_tau
+        elif cfg.psi_method == 'power':
+            psi_kwargs['alpha'] = cfg.psi_alpha
+        elif cfg.psi_method == 'softmax':
+            psi_kwargs['tau'] = cfg.psi_tau
+
+        self.psi = PsiNormalization(method=cfg.psi_method, **psi_kwargs)
 
     # ---------------------------------------------------------
     #  Precomputation helpers

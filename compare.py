@@ -27,16 +27,34 @@ from main import TrainableRNN, ActorCriticReadout, PsiNormalization, generate_tr
 
 
 # ═══════════════════════════════════════════════════════════════
-#  LayerNorm‑Softmax (replicate dmft_solver version for DMFT y)
+#  Apply PsiNormalization  (supports all methods, config‑driven)
 # ═══════════════════════════════════════════════════════════════
-def layer_norm_softmax(logits, tau=1.0, eps=1e-8):
-    mean = logits.mean(dim=-1, keepdim=True)
-    var  = ((logits - mean) ** 2).mean(dim=-1, keepdim=True)
-    std  = torch.sqrt(var + eps)
-    z    = (logits - mean) / std
-    if tau != 1.0:
-        z = z / tau
-    return F.softmax(z, dim=-1)
+def apply_psi(logits, psi_cfg):
+    method = psi_cfg.get("method", "layer_norm_softmax")
+    tau    = psi_cfg.get("tau", 1.0)
+    eps    = psi_cfg.get("eps", 1e-8)
+    alpha  = psi_cfg.get("alpha", 2.0)
+
+    if method == 'power':
+        m, _ = logits.min(dim=-1, keepdim=True)
+        shifted = logits - m + eps
+        powered = shifted.pow(alpha)
+        return powered / powered.sum(dim=-1, keepdim=True)
+
+    elif method == 'layer_norm_softmax':
+        mean = logits.mean(dim=-1, keepdim=True)
+        var  = ((logits - mean) ** 2).mean(dim=-1, keepdim=True)
+        std  = torch.sqrt(var + eps)
+        z    = (logits - mean) / std
+        if tau != 1.0:
+            z = z / tau
+        return F.softmax(z, dim=-1)
+
+    elif method == 'softmax':
+        if tau != 1.0:
+            logits = logits / tau
+        return F.softmax(logits, dim=-1)
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -67,6 +85,14 @@ def compare_configs(dmft_cfg, nn_cfg):
     if ds_dmft != ds_nn:
         print(f"  ✗  data_seed:  DMFT={ds_dmft}  NN={ds_nn}")
         ok = False
+    # psi method
+    pm_dmft = dmft_cfg.get("psi", {}).get("method", "layer_norm_softmax")
+    pm_nn   = nn_cfg.get("psi", {}).get("method", "layer_norm_softmax")
+    if pm_dmft != pm_nn:
+        print(f"  ✗  psi.method:  DMFT={pm_dmft}  NN={pm_nn}")
+        ok = False
+    else:
+        print(f"  ✓ Psi method: {pm_dmft}")
     if ok:
         print("  ✓ All critical hyperparameters match")
     return ok
@@ -193,10 +219,13 @@ def compute_empirical(rnn, ac, input_seqs, cfg_dict):
 #  Plotting
 # ═══════════════════════════════════════════════════════════════
 def make_comparison_figures(C_dmft, C_emp, y_dmft, y_emp, z_dmft, z_emp,
-                             cfg_dict, dmft_dir, nn_dir, out_dir):
-    M = cfg_dict["task"]["M"]
-    T = cfg_dict["task"]["T"]
+                             dmft_cfg, nn_cfg, dmft_dir, nn_dir, out_dir):
+    M = nn_cfg["task"]["M"]
+    T = nn_cfg["task"]["T"]
     K = M * T
+
+    psi_cfg = dmft_cfg.get("psi", nn_cfg.get("psi", {"method": "layer_norm_softmax",
+                                                        "tau": 1.0, "eps": 1e-8}))
 
     C_dmft_np = C_dmft.detach().cpu().numpy()
     C_emp_np = C_emp.detach().cpu().numpy()
@@ -208,8 +237,8 @@ def make_comparison_figures(C_dmft, C_emp, y_dmft, y_emp, z_dmft, z_emp,
     # --- compute π ---
     y_dmft_t = torch.from_numpy(y_dmft_np.T).double()   # (K, 2)
     y_emp_t  = torch.from_numpy(y_emp_np.T).double()
-    pi_dmft  = layer_norm_softmax(y_dmft_t).cpu().numpy()
-    pi_emp   = layer_norm_softmax(y_emp_t).cpu().numpy()
+    pi_dmft  = apply_psi(y_dmft_t, psi_cfg).cpu().numpy()
+    pi_emp   = apply_psi(y_emp_t, psi_cfg).cpu().numpy()
 
     dpi_dmft  = pi_dmft[:, 1]          # prob of action 1, (K,)
     dpi_emp   = pi_emp[:, 1]
@@ -344,8 +373,8 @@ def make_comparison_figures(C_dmft, C_emp, y_dmft, y_emp, z_dmft, z_emp,
 #  Main
 # ═══════════════════════════════════════════════════════════════
 def main():
-    dmft_dir = "results/experiment_1"
-    nn_dir   = "results/experiment_1_nn"
+    dmft_dir = "results/experiment_2"
+    nn_dir   = "results/experiment_2_nn"
     # for i, arg in enumerate(sys.argv[1:]):
     #     if arg == "--dmft_dir" and i + 2 < len(sys.argv):
     #         dmft_dir = sys.argv[i + 2]
@@ -409,7 +438,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n--- Generating comparison figures → {out_dir} ---")
     make_comparison_figures(C_dmft, C_emp, y_dmft, y_emp, z_dmft, z_emp,
-                             nn_cfg, dmft_dir, nn_dir, out_dir)
+                             dmft_cfg, nn_cfg, dmft_dir, nn_dir, out_dir)
     print(f"\n  Comparison figures saved to {out_dir}/")
     print("Done.")
 

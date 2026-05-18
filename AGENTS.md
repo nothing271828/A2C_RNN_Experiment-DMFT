@@ -13,7 +13,7 @@ This repo implements a **DMFT (Dynamical Mean-Field Theory) saddle-point solver*
 | `compute.py` | Standalone compute entry-point: parameter setup, experiment-folder management, checkpoint auto-resume, SIGTERM handling, and auto-extend of `max_iter` on exhaustion |
 | `compare.py` | DMFT‑vs‑NN comparison: loads DMFT checkpoint and trained NN from their experiment directories, verifies hyperparameter/input consistency, computes empirical C/y/z from the NN, plots side‑by‑side comparisons with Pearson correlations |
 
-**Critical invariant**: All files use the **same** hyperparameters, task, reward structure, and policy normalization (`layer_norm_softmax`, tau=1). When changing one, update the others.
+**Critical invariant**: All files use the **same** hyperparameters, task, reward structure, and policy normalization. PsiNormalization supports three methods (`layer_norm_softmax`, `power`, `softmax`) with configurable parameters (tau, eps, alpha). When changing one, update the others.
 
 ## Commands
 

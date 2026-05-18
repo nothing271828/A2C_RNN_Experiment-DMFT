@@ -32,7 +32,7 @@ from dmft_solver import (
 # ============================================================
 #  Experiment directory  (change this or pass --dir from CLI)
 # ============================================================
-EXP_DIR = "results/experiment_1"
+EXP_DIR = "results/experiment_2"
 
 
 # ============================================================
@@ -42,7 +42,7 @@ CONFIG = {
     # --- Network ---
     "network": {
         "N":     100,
-        "g":     1.5,
+        "g":     1,
         "dt":    0.1,
         "D_in":  10,
         "D_a":   2,
@@ -54,7 +54,7 @@ CONFIG = {
         "M":           2,
         "sigma_noise": 2.0,
         "gamma":       0.95,
-        "c_p":         1.0,
+        "c_p":         1.5,
         "c_v":         1.0,
         "beta":        10000.0,
     },
@@ -67,6 +67,14 @@ CONFIG = {
         "warm_start": True,
     },
 
+    # --- Psi normalization ---
+    "psi": {
+        "method": "layer_norm_softmax",
+        "tau":    0.5,
+        "eps":    1e-8,
+        "alpha":  2.0,
+    },
+
     # --- Random seeds ---
     "random_seeds": {
         "solver_seed": 42,
@@ -76,7 +84,7 @@ CONFIG = {
     # --- Optimisation ---
     "optimizer": {
         "scheme":          "diag",
-        "max_iter":        25000,
+        "max_iter":        10000,
         "tol_grad":        1e-3,
         "N_samples_start": 2000,
         "N_samples_end":   4000,
@@ -159,6 +167,7 @@ def build_solver_and_optimizer(cfg_dict):
     nc = cfg_dict["network"]
     tc = cfg_dict["task"]
     dn = cfg_dict["dmft_numerics"]
+    ps = cfg_dict.get("psi", {})
     rs = cfg_dict["random_seeds"]
     oc = cfg_dict["optimizer"]
 
@@ -177,6 +186,10 @@ def build_solver_and_optimizer(cfg_dict):
         eps_reg=dn["eps_reg"],
         dtype=dtype,
         warm_start=dn.get("warm_start", False),
+        psi_method=ps.get("method", "layer_norm_softmax"),
+        psi_tau=ps.get("tau", 1.0),
+        psi_eps=ps.get("eps", 1e-8),
+        psi_alpha=ps.get("alpha", 2.0),
     )
 
     input_seqs, targets = generate_dataset(cfg, seed=rs["data_seed"])

@@ -3,8 +3,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import math
+import os
+import sys
+import json
 # -------------------- 设备选择 --------------------
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = 'cpu'
@@ -176,9 +181,9 @@ def compute_loss_for_trial(rnn, ac_model, psi, I_seq, mean_sign,
                ac_model.actor.weight.pow(2).sum() +
                ac_model.critic.weight.pow(2).sum())
 
-    total_loss = N * (policy_loss + value_loss) + l2_loss / (2 * beta)
+    total_loss = rnn.N * (policy_loss + value_loss) + l2_loss / (2 * beta)
     accuracy = correct / T
-    return total_loss, N * policy_loss, N * value_loss, accuracy
+    return total_loss, rnn.N * policy_loss, rnn.N * value_loss, accuracy
 
 
 # -------------------- 评估函数 --------------------
@@ -346,7 +351,7 @@ def train_Langevin(rnn, ac, psi, dataset,
 
 
 # ==================== 绘图函数 ====================
-def plot_training_curves(train_acc_history, test_acc_history, eval_interval):
+def plot_training_curves(train_acc_history, test_acc_history, eval_interval, save_path=None):
     """
     绘制训练与测试准确率曲线。
     """
@@ -359,12 +364,30 @@ def plot_training_curves(train_acc_history, test_acc_history, eval_interval):
     plt.title('Accuracy over Training')
     plt.legend()
     plt.grid(True)
-    plt.show()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Training curve saved to {save_path}")
+    else:
+        plt.show()
+    plt.close()
 
 
-# ==================== 主程序示例 ====================
-if __name__ == "__main__":
-    # 超参数
+# ==================== 主程序 ====================
+def main():
+    # ---- 实验目录 ----
+    exp_dir = "results/experiment_1_nn"
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg == "--dir" and i + 2 < len(sys.argv):
+            exp_dir = sys.argv[i + 2]
+        elif arg.startswith("--dir="):
+            exp_dir = arg.split("=", 1)[1]
+
+    if os.path.isdir(exp_dir):
+        print(f"Directory '{exp_dir}' already exists — skipping (delete to retrain).")
+        return
+    os.makedirs(exp_dir, exist_ok=True)
+
+    # ---- 超参数 ----
     N = 100
     g = 1.5
     dt = 0.1
@@ -379,13 +402,29 @@ if __name__ == "__main__":
     eval_interval = 1
     patience = 50
     beta = 10000
+    psi_method = 'layer_norm_softmax'
+    psi_tau = 1.0
 
     seed_everything = 42
+    data_seed = 12345
+
+    # ---- 保存完整 config ----
+    config = {
+        "network": {"N": N, "g": g, "dt": dt, "D_in": D_in, "D_a": 2},
+        "task": {"T": T_dur, "M": 2, "sigma_noise": sigma_noise,
+                  "gamma": gamma_, "c_p": c_p, "c_v": c_v, "beta": beta},
+        "training": {"method": "langevin", "lr": lr,
+                      "max_epochs": max_epochs, "eval_interval": eval_interval,
+                      "patience": patience},
+        "psi": {"method": psi_method, "tau": psi_tau},
+        "random_seeds": {"solver_seed": seed_everything, "data_seed": data_seed},
+        "device": str(device),
+    }
+
     torch.manual_seed(seed_everything)
     np.random.seed(seed_everything)
 
-    # 生成固定数据集
-    data_seed = 12345
+    # ---- 生成固定数据集 (seed=12345, same as DMFT) ----
     torch.manual_seed(data_seed)
     dataset = [
         {'I_seq': generate_trial(T_dur, D_in, 1, sigma_noise), 'mean_sign': 1},
@@ -396,33 +435,48 @@ if __name__ == "__main__":
 
     torch.manual_seed(seed_everything)
 
-    # 初始化模型
+    # ---- 初始化模型 ----
     rnn = TrainableRNN(N, D_in, g=g, dt=dt, seed=seed_everything).to(device)
     ac = ActorCriticReadout(N, c_v).to(device)
-    psi = PsiNormalization(method='layer_norm_softmax', tau=1)
+    psi = PsiNormalization(method=psi_method, tau=psi_tau)
 
-    # # --- 使用 Adam 训练 ---
-    # print("\n===== Training with Adam =====")
-    # rnn_adam, ac_adam, train_hist_adam, test_hist_adam = train_A2C(
-    #     rnn, ac, psi, dataset,
-    #     T_dur=T_dur, D_in=D_in, sigma_noise=sigma_noise,
-    #     gamma=gamma_, c_p=c_p, c_v=c_v, beta=beta,
-    #     lr=lr, max_epochs=max_epochs, eval_interval=eval_interval,
-    #     patience=patience, device=device
-    # )
-    # plot_training_curves(train_hist_adam, test_hist_adam, eval_interval)
-
-    # --- 重新初始化，使用 Langevin 训练 ---
-    torch.manual_seed(seed_everything)
-    rnn2 = TrainableRNN(N, D_in, g=g, dt=dt, seed=seed_everything).to(device)
-    ac2 = ActorCriticReadout(N, c_v).to(device)
-
+    # ---- Langevin 训练 ----
     print("\n===== Training with Langevin Dynamics =====")
-    rnn_lang, ac_lang, train_hist_lang, test_hist_lang = train_Langevin(
-        rnn2, ac2, psi, dataset,
+    rnn, ac, train_hist, test_hist = train_Langevin(
+        rnn, ac, psi, dataset,
         T_dur=T_dur, D_in=D_in, sigma_noise=sigma_noise,
         gamma=gamma_, c_p=c_p, c_v=c_v, beta=beta,
         lr=lr, max_epochs=max_epochs, eval_interval=eval_interval,
         patience=patience, device=device
     )
-    plot_training_curves(train_hist_lang, test_hist_lang, eval_interval)
+
+    # ---- 保存结果 ----
+    config_path = os.path.join(exp_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"  Config saved to {config_path}")
+
+    rnn_path = os.path.join(exp_dir, "rnn_state.pt")
+    torch.save(rnn.state_dict(), rnn_path)
+    print(f"  RNN state saved to {rnn_path}")
+
+    ac_path = os.path.join(exp_dir, "ac_state.pt")
+    torch.save(ac.state_dict(), ac_path)
+    print(f"  Actor-Critic state saved to {ac_path}")
+
+    curve_path = os.path.join(exp_dir, "training_curve.png")
+    plot_training_curves(train_hist, test_hist, eval_interval, save_path=curve_path)
+
+    results = {
+        "train_acc_history": train_hist,
+        "test_acc_history": test_hist,
+        "final_test_acc": evaluate(rnn, ac, psi, T_dur, D_in, sigma_noise, num_trials=200),
+    }
+    results_path = os.path.join(exp_dir, "training_results.pt")
+    torch.save(results, results_path)
+    print(f"  Training results saved to {results_path}")
+    print(f"  Final test accuracy: {results['final_test_acc']:.4f}")
+
+
+if __name__ == "__main__":
+    main()

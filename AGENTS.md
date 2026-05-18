@@ -8,9 +8,10 @@ This repo implements a **DMFT (Dynamical Mean-Field Theory) saddle-point solver*
 | File | Role |
 |------|------|
 | `algorithm.tex` | Theory: DMFT action S, its decomposition, derivative formulas, and numerical algorithm |
-| `main.py` | Numerical experiment: trains an A2C RNN via Adam or Langevin dynamics on a binary classification task (M=2 fixed trajectories, T=30) |
+| `main.py` | Numerical experiment: trains an A2C RNN via Adam or Langevin dynamics on a binary classification task (M=2 fixed trajectories, T=30); saves trained model + config to experiment directory |
 | `dmft_solver.py` | DMFT solver: computes S(C,Ĉ,y,ŷ,z,ẑ) and all gradients, with self-verification; includes `DMFTMinimaxOptimizer` with Adam-based minimax solver and checkpoint save/load |
 | `compute.py` | Standalone compute entry-point: parameter setup, experiment-folder management, checkpoint auto-resume, SIGTERM handling, and auto-extend of `max_iter` on exhaustion |
+| `compare.py` | DMFT‑vs‑NN comparison: loads DMFT checkpoint and trained NN from their experiment directories, verifies hyperparameter/input consistency, computes empirical C/y/z from the NN, plots side‑by‑side comparisons with Pearson correlations |
 
 **Critical invariant**: All files use the **same** hyperparameters, task, reward structure, and policy normalization (`layer_norm_softmax`, tau=1). When changing one, update the others.
 
@@ -26,6 +27,13 @@ python dmft_solver.py --optimize
 # Standalone DMFT compute with experiment folder & checkpoint resume
 python compute.py                          # uses default dir
 python compute.py --dir results/my_exp     # specify experiment directory
+
+# Train the RNN and save results to experiment directory
+python main.py                             # uses default dir
+python main.py --dir results/nn_exp        # specify experiment directory
+
+# Compare DMFT theory vs trained RNN
+python compare.py --dmft_dir results/experiment_1 --nn_dir results/nn_exp
 
 # Run the neural network experiment (Langevin dynamics training)
 python main.py
@@ -97,3 +105,32 @@ results/<exp_name>/
 **Interrupt handling**: `compute.py` registers a SIGTERM handler that raises `KeyboardInterrupt`. The `run()` loop catches this and saves a checkpoint before exiting. `Ctrl+C` (SIGINT) also triggers the same path. Run again to resume.
 
 **Checkpoint file size**: ~190 KB per checkpoint (6 params + 6 Adam states, float64, K=60). Periodic saves at `save_interval=50` are negligible in disk usage.
+
+## NN experiment saving (main.py)
+
+`main.py` saves trained models per experiment directory:
+
+```
+results/<nn_exp>/
+├── config.json            # full hyperparameter record
+├── rnn_state.pt           # trained RNN weights (state_dict)
+├── ac_state.pt            # trained Actor‑Critic readout weights
+├── training_curve.png     # accuracy plot
+└── training_results.pt    # train/test accuracy histories + final test acc
+```
+
+If the directory already exists, `main.py` skips training to avoid overwriting.
+
+## DMFT‑vs‑NN comparison (compare.py)
+
+`compare.py` loads both experiment directories and produces a quantitative comparison:
+
+```
+results/<nn_exp>/comparison/
+├── compare_C.png          # C heatmaps + scatter  (with Pearson r)
+├── compare_y.png          # y line plots + scatter
+├── compare_z_pi.png       # z and π plots + scatter
+└── correlations.json      # Pearson correlations for C, y, z, π
+```
+
+The empirical C is computed as `(1/N) φ φᵀ` from the NN's activations; empirical y and z are the raw actor logits and critic values (matching the DMFT definitions). All quantities use float64 for comparison even though the NN was trained in float32.
